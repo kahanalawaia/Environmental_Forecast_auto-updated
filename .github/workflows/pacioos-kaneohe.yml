@@ -1,0 +1,50 @@
+name: PacIOOS Kaneohe feed
+
+# Pulls PacIOOS ROMS surface currents/temperature and WW3 waves for the Kaneohe box
+# (squares K3, L3, L4) and force-pushes them to the `pacioos-data` branch, which the
+# Kaneohe pelagic forecast (6:37 PM HST, Claude) reads. Times below are UTC.
+on:
+  schedule:
+    - cron: "47 2 * * *"   # 4:47 PM HST
+    - cron: "47 3 * * *"   # 5:47 PM HST, second try ahead of the 6:37 PM forecast
+    - cron: "47 15 * * *"  # 5:47 AM HST morning refresh
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pacioos-feed
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch PacIOOS data for the Kaneohe box
+        run: python3 pacioos/fetch_pacioos_kaneohe.py --out "$RUNNER_TEMP/feed"
+
+      - name: Publish to the pacioos-data branch (no history kept)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/feed"
+          git init -q -b pacioos-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "PacIOOS Kaneohe feed $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pacioos-data
+
+      - name: Heartbeat on main (keeps GitHub from pausing the schedule after 60 quiet days)
+        if: github.event.schedule == '47 2 * * *' || github.event_name == 'workflow_dispatch'
+        run: |
+          cp "$RUNNER_TEMP/feed/README.md" pacioos/STATUS.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pacioos/STATUS.md
+          git diff --cached --quiet || git commit -q -m "PacIOOS feed status $(date -u +%Y-%m-%d)"
+          git push -q origin HEAD:main
