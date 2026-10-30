@@ -3,7 +3,7 @@
 PacIOOS feed for the Kaneohe pelagic forecast (squares K3, L3, L4 off windward O'ahu).
 
 Runs on GitHub Actions (PacIOOS ERDDAP is reachable from GitHub's runners but not from
-Claude's cloud workspace). Pulls, for the box 21.20-21.80 N, 158.06-157.44 W:
+Claude's cloud workspace). Pulls, for the box 21.20-21.80 N, 158.06-157.30 W (K3, L3, L4 plus T buoy):
 
   kaneohe_roms.json  PacIOOS ROMS Main Hawaiian Islands (roms_hiig), shallowest layer (0.25 m):
                      u, v (m/s, eastward / northward -- the direction the water is flowing TOWARD)
@@ -18,7 +18,7 @@ import argparse, csv, io, json, math, os, sys, time, urllib.request
 from datetime import datetime, timedelta, timezone
 
 ERDDAP = "https://pae-paha.pacioos.hawaii.edu/erddap/griddap"
-LAT0, LAT1, LON0, LON1 = 21.20, 21.80, -158.06, -157.44
+LAT0, LAT1, LON0, LON1 = 21.20, 21.80, -158.06, -157.30  # east edge widened 2026-10-29 to cover T buoy (157-25.8W)
 BACK_H, AHEAD_H = 3, 60
 UA = "kaneohe-pelagic-forecast/1.0 (GitHub Actions; personal fishing research)"
 
