@@ -7,7 +7,10 @@ name: PacIOOS Kaneohe feed
 # GitHub has been starting scheduled runs on this repo 4-8 hours late, so the slots are spread through the
 # day rather than bunched before the forecast. PacIOOS silently drops connections from some
 # GitHub runners: when that happens the run waits 5 minutes and starts itself again on a fresh
-# runner, up to 4 tries in all.
+# runner, up to 4 tries in all. A try that hands off to the next one ends green (with a warning);
+# only a miss on the last try ends red. Retries are started by github-actions[bot], so GitHub
+# wouldn't email Matyi about that last one: it opens (or comments on) an issue labelled
+# pacioos-feed instead, and the next good run closes it.
 on:
   schedule:
     - cron: "47 15 * * *"  # 5:47 AM HST (has been landing ~10 AM)
@@ -24,6 +27,7 @@ on:
 permissions:
   contents: write
   actions: write   # lets a failed run start its own retry
+  issues: write    # opens/closes the "feed missed" issue
 
 concurrency:
   group: pacioos-feed
@@ -49,10 +53,15 @@ jobs:
           ls -la "$RUNNER_TEMP/feed"
 
       - name: Fetch PacIOOS data for the Kaneohe box
+        id: fetch
         timeout-minutes: 18
+        continue-on-error: true
         run: python3 pacioos/fetch_pacioos_kaneohe.py --out "$RUNNER_TEMP/feed"
 
       - name: Publish to the pacioos-data branch (no history kept)
+        id: publish
+        if: steps.fetch.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -70,7 +79,7 @@ jobs:
           exit 1
 
       - name: Heartbeat on main (keeps GitHub from pausing the schedule after 60 quiet days)
-        if: github.event.schedule == '47 2 * * *' || (github.event_name == 'workflow_dispatch' && env.ATTEMPT == '1')
+        if: steps.publish.outcome == 'success' && (github.event.schedule == '47 2 * * *' || (github.event_name == 'workflow_dispatch' && env.ATTEMPT == '1'))
         continue-on-error: true
         run: |
           cp "$RUNNER_TEMP/feed/README.md" pacioos/STATUS.md
@@ -85,12 +94,46 @@ jobs:
           done
           exit 1
 
-      - name: Try again on a fresh runner
-        if: failure() && fromJSON(env.ATTEMPT) < fromJSON(env.MAX_ATTEMPTS)
+      - name: Close the "feed missed" issue now that data is flowing again
+        if: steps.publish.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --label pacioos-feed --json number -q '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Feed is back: try $ATTEMPT got through and published ($RUN_URL)."
+          done
+
+      - name: Hand off to a fresh runner
+        id: handoff
+        if: (steps.fetch.outcome == 'failure' || steps.publish.outcome == 'failure') && fromJSON(env.ATTEMPT) < fromJSON(env.MAX_ATTEMPTS)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           next=$((ATTEMPT + 1))
-          echo "Run failed on try $ATTEMPT; starting try $next of $MAX_ATTEMPTS in 5 minutes."
+          what="PacIOOS fetch"; [ "${{ steps.publish.outcome }}" = failure ] && what="push to pacioos-data"
+          echo "::warning::Try $ATTEMPT of $MAX_ATTEMPTS failed ($what). Handing off to try $next on a fresh runner in 5 minutes; nothing to do unless the last try fails."
+          echo "Try $ATTEMPT failed ($what); try $next starts on a fresh runner in 5 minutes." >> "$GITHUB_STEP_SUMMARY"
           sleep 300
-          gh workflow run pacioos-kaneohe.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f attempt="$next"
+          gh workflow run pacioos-kaneohe.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f attempt="$next" \
+            || { echo "::error::Couldn't start try $next."; exit 1; }
+
+      - name: All tries failed - open an issue and end red
+        if: >-
+          !cancelled() && (steps.fetch.outcome == 'failure' || steps.publish.outcome == 'failure') &&
+          (fromJSON(env.ATTEMPT) >= fromJSON(env.MAX_ATTEMPTS) || steps.handoff.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          msg="Try $ATTEMPT of $MAX_ATTEMPTS failed and no more tries are coming, at $(date -u +%Y-%m-%dT%H:%MZ) ($RUN_URL). The forecast keeps using the last good feed until it is 36 h old, then runs without currents and says so. The next scheduled run tries again."
+          gh label create pacioos-feed -R "$GITHUB_REPOSITORY" --color B60205 --description "PacIOOS feed alerts" 2>/dev/null || true
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label pacioos-feed --json number -q '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "$msg"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --label pacioos-feed --title "PacIOOS feed missed: all $MAX_ATTEMPTS tries failed" --body "$msg"
+          fi
+          echo "::error::$msg"
+          exit 1
