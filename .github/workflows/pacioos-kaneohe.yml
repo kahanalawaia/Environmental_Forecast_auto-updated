@@ -1,30 +1,55 @@
 name: PacIOOS Kaneohe feed
 
 # Pulls PacIOOS ROMS surface currents/temperature and WW3 waves for the Kaneohe box
-# (squares K3, L3, L4) and force-pushes them to the `pacioos-data` branch, which the
+# (squares K3, L3, L4 plus T buoy) and force-pushes them to the `pacioos-data` branch, which the
 # Kaneohe pelagic forecast (6:37 PM HST, Claude) reads. Times below are UTC.
+#
+# GitHub has been starting scheduled runs on this repo 4-8 hours late, so the slots are spread through the
+# day rather than bunched before the forecast. PacIOOS silently drops connections from some
+# GitHub runners: when that happens the run waits 5 minutes and starts itself again on a fresh
+# runner, up to 4 tries in all.
 on:
   schedule:
-    - cron: "47 2 * * *"   # 4:47 PM HST
-    - cron: "47 3 * * *"   # 5:47 PM HST, second try ahead of the 6:37 PM forecast
-    - cron: "47 15 * * *"  # 5:47 AM HST morning refresh
+    - cron: "47 15 * * *"  # 5:47 AM HST (has been landing ~10 AM)
+    - cron: "17 19 * * *"  # 9:17 AM HST (lands ~1-2 PM, ahead of the forecast)
+    - cron: "17 22 * * *"  # 12:17 PM HST (lands ~4-5 PM, ahead of the forecast)
+    - cron: "47 2 * * *"   # 4:47 PM HST (lands overnight) + weekly-ish heartbeat on main
   workflow_dispatch:
+    inputs:
+      attempt:
+        description: "Try number (set automatically on retries; leave at 1)"
+        required: false
+        default: "1"
 
 permissions:
   contents: write
+  actions: write   # lets a failed run start its own retry
 
 concurrency:
   group: pacioos-feed
   cancel-in-progress: false
 
+env:
+  ATTEMPT: ${{ inputs.attempt || '1' }}
+  MAX_ATTEMPTS: "4"
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
+      - name: Start from the last published files (a dataset that fails this run keeps its old copy)
+        run: |
+          mkdir -p "$RUNNER_TEMP/feed"
+          if git fetch -q --depth=1 origin pacioos-data; then
+            git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/feed"
+          fi
+          ls -la "$RUNNER_TEMP/feed"
+
       - name: Fetch PacIOOS data for the Kaneohe box
+        timeout-minutes: 18
         run: python3 pacioos/fetch_pacioos_kaneohe.py --out "$RUNNER_TEMP/feed"
 
       - name: Publish to the pacioos-data branch (no history kept)
@@ -37,14 +62,35 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -q -m "PacIOOS Kaneohe feed $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pacioos-data
+          # GitHub occasionally answers a push with "Internal Server Error"; try a few times
+          for i in 1 2 3 4; do
+            git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pacioos-data && exit 0
+            echo "push failed (try $i/4)"; sleep $((i * 20))
+          done
+          exit 1
 
       - name: Heartbeat on main (keeps GitHub from pausing the schedule after 60 quiet days)
-        if: github.event.schedule == '47 2 * * *' || github.event_name == 'workflow_dispatch'
+        if: github.event.schedule == '47 2 * * *' || (github.event_name == 'workflow_dispatch' && env.ATTEMPT == '1')
+        continue-on-error: true
         run: |
           cp "$RUNNER_TEMP/feed/README.md" pacioos/STATUS.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add pacioos/STATUS.md
-          git diff --cached --quiet || git commit -q -m "PacIOOS feed status $(date -u +%Y-%m-%d)"
-          git push -q origin HEAD:main
+          git diff --cached --quiet && exit 0
+          git commit -q -m "PacIOOS feed status $(date -u +%Y-%m-%d)"
+          for i in 1 2 3; do
+            git pull -q --rebase origin main && git push -q origin HEAD:main && exit 0
+            sleep $((i * 20))
+          done
+          exit 1
+
+      - name: Try again on a fresh runner
+        if: failure() && fromJSON(env.ATTEMPT) < fromJSON(env.MAX_ATTEMPTS)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          next=$((ATTEMPT + 1))
+          echo "Run failed on try $ATTEMPT; starting try $next of $MAX_ATTEMPTS in 5 minutes."
+          sleep 300
+          gh workflow run pacioos-kaneohe.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f attempt="$next"

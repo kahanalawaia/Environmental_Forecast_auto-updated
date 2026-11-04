@@ -13,8 +13,13 @@ Claude's cloud workspace). Pulls, for the box 21.20-21.80 N, 158.06-157.30 W (K3
 
 Both cover from 3 hours ago to 60 hours ahead (or the end of the model run, if sooner).
 Standard library only. Usage: python3 fetch_pacioos_kaneohe.py --out DIR
+
+Exit codes: 0 = at least one file written (a file that failed this run keeps its previous copy,
+if the workflow seeded DIR with the last published files); 1 = nothing fetched; 75 = PacIOOS
+refused or ignored connections from this runner (the workflow then retries on a fresh runner).
 """
-import argparse, csv, io, json, math, os, sys, time, urllib.request
+import argparse, csv, io, json, math, os, socket, sys, time, urllib.request
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 ERDDAP = "https://pae-paha.pacioos.hawaii.edu/erddap/griddap"
@@ -27,7 +32,25 @@ def log(*a):
     print("[pacioos]", *a, flush=True)
 
 
-def get(url, timeout=180, retries=4):
+UNREACHABLE = 75  # EX_TEMPFAIL
+
+
+def reachable(tries=3, timeout=20):
+    """PacIOOS silently drops connections from some GitHub runners. Find out in about a minute
+    instead of burning the job's whole time limit on request timeouts."""
+    host = urlparse(ERDDAP).hostname
+    for i in range(tries):
+        try:
+            socket.create_connection((host, 443), timeout=timeout).close()
+            return True
+        except OSError as e:
+            log(f"  {host}:443 not answering ({e}), try {i + 1}/{tries}")
+            if i + 1 < tries:
+                time.sleep(10)
+    return False
+
+
+def get(url, timeout=90, retries=3):
     err = None
     for i in range(retries):
         try:
@@ -122,6 +145,9 @@ def main():
     ap.add_argument("--out", default="feed")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    if not reachable():
+        log("PacIOOS is not reachable from this runner; nothing written")
+        sys.exit(UNREACHABLE)
     gen = iso(datetime.now(timezone.utc))
     status, ok = [], 0
     for name, fn in (("kaneohe_roms.json", fetch_roms), ("kaneohe_ww3.json", fetch_ww3)):
@@ -136,10 +162,16 @@ def main():
                           f"{len(d['lat'])}x{len(d['lon'])} grid")
             ok += 1
         except Exception as e:  # noqa: BLE001
-            status.append(f"- {name}: FAILED ({e})")
+            kept = ""
+            try:
+                with open(os.path.join(a.out, name)) as f:
+                    kept = f"; kept the previous copy from {json.load(f).get('generated', '?')}"
+            except Exception:  # noqa: BLE001
+                pass
+            status.append(f"- {name}: FAILED this run ({e}){kept}")
             log(f"{name} failed: {e}")
     with open(os.path.join(a.out, "README.md"), "w") as f:
-        f.write("# PacIOOS feed: Kaneohe box (K3, L3, L4)\n\n"
+        f.write("# PacIOOS feed: Kaneohe box (K3, L3, L4 + T buoy)\n\n"
                 f"Generated {gen} by GitHub Actions (`pacioos/fetch_pacioos_kaneohe.py` on `main`).\n"
                 "This branch is overwritten on every run; it keeps no history.\n\n" + "\n".join(status) + "\n\n"
                 "Sources: PacIOOS ERDDAP `roms_hiig` and `ww3_hawaii_lon180` (free to use and redistribute; "
